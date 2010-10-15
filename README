@@ -1,3 +1,442 @@
-Welcome to the Stored Procedure Debugging Routines!
+Debugging Stored Procedures
 
-Please read the debugging_procs.txt to learn how to use these procedures
+Over the past several weeks, we've been working on debugging a stored
+procedure bug for a client. Coming from a software development background, I
+looked at the procedure like any piece of code -- how can I debug the
+program and be able to use some means of knowing the values within the
+program while it's running? In C, I've always used GDB, as well as Perl
+having it's own debugger. I also love print statements! Those can be the
+most simplistic but also useful tools in debugging, especially in the case
+of a C program that's so optimized that GDB gives you the famous "value
+optimized out" message, preventing you from knowing what the program is
+really doing. 
+
+Stored procedures are a whole different matter than compiled or interpreted
+code. They are executing within the database. The line numbers in your
+source file you inevitably create the procedure with don't match the line
+numbers of the procedure as stored by the database. Furthermore, if you are
+a developer of other languages, you will find debugging stored procedures to 
+be a exercise in misery. You can load a stored procedure into MySQL, and as 
+long as the SQL is syntactically correct, it will not catch things such as 
+specifying variables that don't exist-- you will have the joy of discovering
+those during run-time-- and most often the error message displayed will 
+be of little use. 
+
+How then, can you better observe the execution of a stored procedure? 
+
+In some cases, you could run it with print statements and simply observe the
+output when the procedure is executed. But in our case, that was not a
+solution as the procedure had mostly DML statements and we needed something
+that was more precise. We needed something that not only allows you to
+display the values of variables, but also show you when the statement was
+executed. 
+
+There is this very useful article on Dr. Dobbs, a concept that we expanded upon
+(http://www.drdobbs.com/database/218100564;jsessionid=BZTU3OQCTRMTFQE1GHRSKHWATMY32JVN?pgno=2).
+The main idea of this article is that a temporary memory table is used
+during the execution of the stored procedure to insert stored procedure
+debug messages into, and being a memory table, won't touch disk and will 
+be as lightweight as possible. At the end of a debug session, these 
+messages are copied from the temporary table into a permanent table 
+with the same table definition. This gives you a means of reading 
+the debug messages written during the execution of your stored procedure.
+
+We built upon the idea from the article and came up with these useful stored procedures that
+are easy to load and utilize in a stored procedure. They allow you to print
+any message that you want to, along with the time and the connection/thread
+ID of the thread executing the procedure-- something that was invaluable in
+debugging what we thought at first was a race condition.
+
+Debugging procedures
+
+The following debugging procedures can be used within your stored procedures. First, each will be introduced, and then a more descriptive explanation on how they work will be provided, along with source code. Note that these procedures are also available at:
+
+ 
+
+setupProcLog()
+
+This procedure you run once at the beginning of your procedure to set up the the temporary table for storing messages in, as well as ensuring that there is a permanent log table.
+
+procLog()
+
+This is the procedure you call for each debug message. 
+
+cleanup()
+
+This is the procedure you call at the end of your debugging session
+
+The code for each of these procedures:
+
+CREATE PROCEDURE setupProcLog()
+BEGIN
+    DECLARE proclog_exists int default 0;
+
+    /* 
+       check if proclog is existing. This check seems redundant, but
+       simply relying on 'create table if not exists' is not enough because
+       a warning is thrown which will be caught by your exception handler
+    */
+    SELECT count(*) INTO proclog_exists
+        FROM information_schema.tables 
+        WHERE table_schema = database() AND table_name = 'proclog';
+
+    IF proclog_exists = 0 THEN 
+         create table if not exists proclog(entrytime datetime, 
+                                        connection_id int not null default 0,
+                                        msg varchar(512));
+    END IF;
+    /* 
+     * temp table is not checked in information_schema because it is a temp
+     * table
+     */
+     create temporary table if not exists tmp_proclog(
+                                                entrytime timestamp, 
+                                                connection_id int not null default 0,
+                                                msg varchar(512)) engine = memory;
+END |
+
+
+As you can see, setupProcLog() first checks to see if the permanent logging
+table exists, and if not, creates it. The second create statement creates the
+tempory memory table for logging messages to. Note that 'if exists' is not
+sufficient for avoiding warnings that will cause your exception handler to be
+called in the event the table already exists and is even created specifying an 'if
+exists' condition. Also note that a storage engine is not specified for proclog. 
+In this case, proclog should be a non-transactional table to avoid any issues with
+the stored procedure using the debugging procedures within a transaction-- you don't
+want all your debug messages rolled-back!
+
+
+CREATE PROCEDURE procLog(in logMsg varchar(512))
+BEGIN
+  declare continue handler for 1146 -- Table not found
+  BEGIN
+    call setupProcLog();
+    insert into tmp_proclog (connection_id, msg) values (connection_id(), 'reset tmp table');
+    insert into tmp_proclog (connection_id, msg) values (connection_id(), logMsg);
+  END;
+
+  insert into tmp_proclog (connection_id, msg) values (connection_id(), logMsg);
+END |
+
+The procLog() procedure is what you use to log messages with. You can see 
+an exception handler is set in case the table is not found, setupProcLog() 
+is called to make sure the both the temporary and permanent log tables exist, 
+as well as display a message that the temporary table has been set up. 
+Then of course, in the case of no exception, the message is inserted into the table.
+
+
+CREATE PROCEDURE cleanup(in logMsg varchar(512))
+BEGIN
+   call procLog(concat("cleanup() ",ifnull(logMsg, ''))); 
+   insert into proclog select * from tmp_proclog;
+   drop table tmp_proclog;
+END |
+
+Finally, the cleanup() procedure copies all entries made during the session 
+into the permanent logging table, then the temporary logging table is truncated.
+Note that this procedure just drops the temporary table, tmp_proclog. This is
+to allow you to be able to run setupProcLog() without a warning about
+tmp_proclog existing. Since all the data has been copied to proclog as well as
+being temporary table that will be re-created if setupProcLog() is called,
+dropping it works out well.
+
+These procedures are easy to use. Just load them into your MySQL instance:
+
+mysql yourschema < proclog.sql
+
+In your procedure code, you are able to now log messages! 
+
+First, you will call:
+
+call setupProcLog();
+
+Then you can log message:
+
+call procLog("this is a message");
+
+Or even with variables:
+
+call procLog(concat("this is a message with a variable - foo = ", ifnull(foo,'NULL')));
+
+Note above the use of ifnull(). This is because concat() fails if the variable
+in the list being concatenated is is NULL.
+
+Now, for an actual procedure. The procedure shown below is for demonstration
+purposes and will show as succinctly as possible the problem we encountered.
+
+The issue was essentially that there is a stored procedure that has a number
+start of a transaction, a number insert statements that occur within a loop 
+into tables relating to a single unique id and then a final check on the 
+primary table to see if that unique id has been inserted already-- and based
+on this, commits or rolls back the subsequent inserts. The procedure looked
+bullet-proof, and it seemed that there would be no way for any of the
+subsequent insert statements to ever be committed, but there was one problem:
+within the loop, there was a call to another stored procedure that also had
+it's own call to start and commit a transaction. You cannot have nested
+transactions in MySQL, and this was the crux of the problem, and what the
+example procedure here will attempt to show, as well as show you how you can
+practically utilize the debugging procedures.
+
+CREATE PROCEDURE proc_example 
+(
+	_username varchar(32)
+)
+ BEGIN
+
+	DECLARE status_code int;
+    DECLARE counter int default 0;
+	DECLARE BAIL int default 0;
+    DECLARE sleep_foo int;
+	
+    /* 
+     * exit handler for anything that goes wrong during execution. This will
+     * ensure the any subsequent DML statements are rolled back
+     */
+	DECLARE EXIT HANDLER FOR SQLEXCEPTION
+	BEGIN
+		SET status_code = -1;
+		ROLLBACK;
+	    SELECT status_code as status_code;
+        call cleanup("line 65: exception handler");
+	END;
+	
+	SET status_code = 0;
+
+    CALL setupProcLog();
+    CALL procLog("line 71: Entering proc_example");
+
+    /* start the transaction - so that anything that follows will be atomic */
+	START TRANSACTION; 
+	
+    call procLog(concat("line 76: START TRANSACTION, status_code=",
+                        ifnull(status_code, NULL)));
+	IF status_code = 0
+	THEN
+        /* 
+         * the loop. The only thing that will cause this loop to end other
+         * than the counter exceeding the value of 5 is if BAIL is set to 1
+         */
+        myloop: LOOP
+            CALL procLog(concat("line 85: loop iteration #",
+                                ifnull(counter, NULL)));
+
+            /* leave the loop is counter exceeds the value of 5 */
+            IF counter > 5 THEN
+                LEAVE myloop;
+            END IF;
+
+            /* 
+             * this statement is just to show an example of an insert
+             * statement that should NOT be committed until the end of 
+             * the procedure, or if the status_code is anything other than
+             * zero then a rollback will result in this statement being rolled
+             * back
+             */
+            INSERT INTO userloop_count (username, count) 
+                VALUES (_username, counter);
+
+            CALL procLog("line 103: CALL someother_proc()");
+            /* 
+             * This call to someother_proc() will set a value for BAIL. This
+             * is the type of thing you want to be cognizant of in your stored 
+             * procedures - that a procedure that you call doesn't have it's
+             * own transaction. Nested transactions are not supported by MySQL
+             */
+            CALL someother_proc(rand(), _username, BAIL);
+            CALL procLog(concat("line 111: BAIL = ", ifnull(BAIL, 'NULL')));
+            IF BAIL THEN
+                SET status_code = 1;
+                LEAVE myloop;
+            END IF;
+
+            SET counter = counter + 1;
+
+        END LOOP;		
+    END IF;
+
+    /* 
+     * this is the do or die part of the procedure that will either commit or
+     * roll back any subsequent DML statements (insert, update, delete, etc)
+     * if the username exists, a status_code of 2 is set, which results in a
+     * rollback, and if not, an insert into users is called. If the insert
+     * fails for any reason, the EXIT handler will also roll back subsequent
+     * statements 
+     *  
+     */
+    IF (status_code = 0)
+    THEN
+        IF (SELECT user_id FROM users WHERE username = _username) IS NOT NULL 
+        THEN 
+            call procLog("line 135: user exists, setting status_code to 5");
+            SET status_code = 2;
+        ELSE
+            call procLog("line 138: user does not exist, inserting");
+	        INSERT INTO users (username) VALUES (_username);
+        END IF;
+    END IF;
+
+    select sleep(3) into sleep_foo;
+    call procLog(concat( "line 148 status_code = ", ifnull(status_code,'NULL')));
+    /* if status_code of 0, then commit, else roll back */
+    IF (status_code = 0) THEN
+	    COMMIT;
+	ELSE
+	    ROLLBACK;
+	END IF;
+			
+    /* 
+     * call cleanup() to ensure the temp proc logging table's entries are
+     * copied to the proclog table
+     */
+    call cleanup("line 160: end of proc");
+	SELECT status_code as status_code;
+
+ END|
+
+As you can see, the call to procLog() gives you the ability to see what line
+of the procedure was called. This all corresponds to the line numbers you have
+in whatever source file you use to add your stored procedure to your database
+from.
+
+As you just saw, there was a call to the someother_proc() procedure. In this
+case, someother_proc()  contains a transaction which will
+demonstrate the problem with trying to attempted nested transactions--
+something that you should always be cognizant of in debugging stored
+procedures
+
+DROP PROCEDURE IF EXISTS someother_proc | 
+CREATE PROCEDURE someother_proc 
+(
+    _rand float,
+	_username varchar(32),
+    out _return_val int
+)
+ MODIFIES SQL DATA
+ BEGIN
+    /* 
+     * this is passed by the calling procedure and is available after the
+     * program is called
+     */
+    set _return_val = 0;
+
+    /* 
+     * this will cause grief for the test procedure that calls it because it
+     * will result in an attempt of a nested procedure, which is not supported
+     * in MySQL. This call will be an implicit commit, so all subsequent DML
+     * statements in the calling procedure will be committed
+     */
+    START TRANSACTION;
+
+    /* 
+     * Arbitrary. Just to have some way to randomly set a true value that the
+     * calling procedure will use to test whether or not to leave the loop
+     * that this procedure was called from
+     */
+    IF (_rand > 0.8)
+    THEN
+        SET _return_val = 1;
+    END IF;
+
+    /* this is here to provide a means to see what random value was tested */
+    INSERT INTO randlog (username, rvalue, returned) 
+        VALUES (_username, _rand, _return_val);
+    
+    COMMIT;
+END|
+
+Now, to actually run this procedure and see what is entred into the proclog
+table. 
+
+mysql> call proc_example('testuser');
++-------------+
+| status_code |
++-------------+
+|           1 | 
++-------------+
+1 row in set (3.04 sec)
+
+So, as can be seen, the status code returned is '1', meaning that the user wasn't inserted. How can this be? Well, now that the procLog() procedure is being utilized, you can query the table 'proclog'
+
+mysql> select * from proclog;
++---------------------+---------------+-------------------------------------------+
+| entrytime           | connection_id | msg                                       |
++---------------------+---------------+-------------------------------------------+
+| 2010-10-15 09:34:27 |            11 | line 71: Entering proc_example            | 
+| 2010-10-15 09:34:27 |            11 | line 76: START TRANSACTION, status_code=0 | 
+| 2010-10-15 09:34:27 |            11 | line 85: loop iteration #0                | 
+| 2010-10-15 09:34:27 |            11 | line 103: CALL someother_proc()           | 
+| 2010-10-15 09:34:27 |            11 | line 111: BAIL = 1                        | 
+| 2010-10-15 09:34:30 |            11 | line 145 status_code = 1                  | 
+| 2010-10-15 09:34:30 |            11 | cleanup() line 156: end of proc           | 
++---------------------+---------------+-------------------------------------------+
+
+Also, randlog can be queried to see what the random value was:
+
+mysql> select * from randlog;
++----+---------------------+----------+----------+----------+
+| id | created             | username | rvalue   | returned |
++----+---------------------+----------+----------+----------+
+|  1 | 2010-10-15 09:34:27 | testuser | 0.880542 |        1 | 
++----+---------------------+----------+----------+----------+
+
+
+Aha! BAIL was set to '1' because of the random value being greater than .5, so the loop ended. This means that the subsequent insert statements should have not been committed, right?  (well, we know there's a nested transaction, but for the sake of this example, let us forget about that momentarily)
+
+The users table should be empty, and it is:
+
+mysql> select * from users;  
+Empty set (0.01 sec)
+
+The next table to check is userloop_count, it too should be empty:
+
+mysql> select * from userloop_count;
++----+---------------------+-------+----------+
+| id | created             | count | username |
++----+---------------------+-------+----------+
+|  1 | 2010-10-15 09:34:27 |     0 | testuser | 
++----+---------------------+-------+----------+
+
+Hmm, but it is not! How could this be? The status code was set to '1', so the ROLLBACK having been issued would roll back all the previous insert statements. What else can we look at? 
+
+Binary Log
+
+The binary log is like a closed circuit TV camera of your database-- at least in terms of DML statements. Any statement that modifies your data will be found in your binary log. Not only that, you can see what thread issued the statement. The evidence is there for you to see!
+
+The following is cleaned up to make clearer:
+
+So, the first line below, the message "loop iteration #0" is inserted into proclog:
+
+#101015  9:34:27 server id 2  end_log_pos 2733  Query   thread_id=11    exec_time=0 error_code=0
+insert into tmp_proclog (connection_id, msg) values (connection_id(),  NAME_CONST('logMsg',_latin1'line 85: loop iteration #0'))/*!*/;
+
+Next, the insertion into userloop_count is made:
+
+#101015  9:34:27 server id 2  end_log_pos 2813  Query   thread_id=11    exec_time=0 error_code=0
+INSERT INTO userloop_count (username, count) 
+                VALUES ( NAME_CONST('_username',_latin1'testuser'),  NAME_CONST('counter',0))/*!*/;
+
+
+The message indicating the call to someother_proc() is inserted into proclog:
+
+#101015  9:34:27 server id 2  end_log_pos 3291  Query   thread_id=11    exec_time=0 error_code=0
+insert into tmp_proclog (connection_id, msg) values (connection_id(),  NAME_CONST('logMsg',_latin1'line 103: CALL someother_proc()'))/*!*/;
+
+Next, the crux of the problem! A COMMIT is issued. How can this be? Well, because there is a 'BEGIN TRANSACTION', which there was already a 'BEGIN TRANSACTION' issued in the calling procedure. Nested transactions are not supported, and when you issue a 'BEGIN TRANSACTION' within a transaction, it acts as an implicite 'COMMIT'
+
+#101015  9:34:27 server id 2  end_log_pos 3318  Xid = 809
+COMMIT/*!*/;
+# at 3318
+
+So, now the problem is know and can be fixed accordingly!
+
+Summary
+
+This post was written to help those who are pulling their hair out debugging their stored procedures. This post was also written for those who might have come from more from a development role and might have an approach that is overly complex. When debugging stored procedures, here are some tips that will help:
+
+* binary log - look at this first when something seems awry. It is the closed-circuit TV recording of what happened with your database
+* utilize these logging procedures to debug your stored procedures
+* look closely at the data in the tables affected by your stored procedures
+
+You will develop an intuition for the types of issues stored procedures present over time. You just have to think a bit differently than with regular programming.  
+
